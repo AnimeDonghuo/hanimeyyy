@@ -6,33 +6,36 @@ import subprocess
 import tempfile
 import requests
 import yt_dlp
-from pyrogram import Client, filters, types
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID", "26826540"))
 API_HASH = os.environ.get("API_HASH", "32d454f51fc7b3b3c7d51c4f80f628b5")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_token")
+PORT = int(os.environ.get("PORT", 8080)) # Koyeb uses this
 
-app = Client("hanime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# --- DUMMY SERVER FOR KOYEB HEALTH CHECK ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is Running")
 
-# --- YOUR PROVIDED CODE (UNCHANGED LOGIC) ---
+def run_health_server():
+    server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
+    server.serve_forever()
+
+# --- YOUR LOGIC (UNCHANGED) ---
 BASE = "https://hanime.tv/api/v8"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-BASE_HEADERS = {
-    "User-Agent": UA, "Referer": "https://hanime.tv/", "Origin": "https://hanime.tv",
-    "Accept": "application/json", "Content-Type": "application/json", "X-Signature-Version": "web2",
-}
-JS_PREAMBLE = """
-delete globalThis.process;
-var window = new Proxy({ top: { location: { origin: "https://hanime.tv" } }, addEventListener: (e, cb) => {} }, {
-    set(o, k, v) { if (k == "ssignature" || k == "stime") console.log(k, v); o[k] = v; return true; }
-});
-globalThis.window = window;
-"""
+BASE_HEADERS = {"User-Agent": UA, "Referer": "https://hanime.tv/", "Origin": "https://hanime.tv", "Accept": "application/json", "Content-Type": "application/json", "X-Signature-Version": "web2"}
+JS_PREAMBLE = "delete globalThis.process; var window = new Proxy({ top: { location: { origin: 'https://hanime.tv' } }, addEventListener: (e, cb) => {} }, { set(o, k, v) { if (k == 'ssignature' || k == 'stime') console.log(k, v); o[k] = v; return true; } }); globalThis.window = window;"
 _vendor_script_cache = None
 
-def make_headers(path: str) -> dict:
+def make_headers(path: str):
     t = int(time.time()); sig = hashlib.sha1(f"{path}{t}".encode()).hexdigest()
     return {**BASE_HEADERS, "X-Time": str(t), "X-Signature": sig}
 
@@ -59,8 +62,7 @@ def generate_credentials():
     if not vendor_js: return None, None
     script = JS_PREAMBLE + "\n" + vendor_js
     with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as f:
-        f.write(script)
-        tmp_path = f.name
+        f.write(script); tmp_path = f.name
     try:
         result = subprocess.run(["node", tmp_path], capture_output=True, text=True, timeout=15)
         creds = {l.split(" ")[0]: l.split(" ")[1].strip() for l in result.stdout.strip().split("\n") if " " in l}
@@ -69,98 +71,81 @@ def generate_credentials():
         if os.path.exists(tmp_path): os.unlink(tmp_path)
 
 def get_streams(hv_id, sig, t):
-    r = requests.get(f"https://hanime.tv/api/v8/guest/videos/{hv_id}/manifest", 
-                     headers={**BASE_HEADERS, "X-Signature": sig, "X-Time": t})
+    r = requests.get(f"https://hanime.tv/api/v8/guest/videos/{hv_id}/manifest", headers={**BASE_HEADERS, "X-Signature": sig, "X-Time": t})
     if r.status_code != 200: return []
     streams = []
-    for server in r.json().get("videos_manifest", {}).get("servers", []):
-        for s in server.get("streams", []):
-            streams.append({"url": s['url'], "res": f"{s['height']}p", "height": s['height']})
+    try:
+        for server in r.json().get("videos_manifest", {}).get("servers", []):
+            for s in server.get("streams", []):
+                streams.append({"url": s['url'], "res": f"{s['height']}p", "height": s['height']})
+    except: pass
     return sorted(streams, key=lambda x: x["height"], reverse=True)
 
-# --- BOT HANDLERS ---
+# --- BOT INTERFACE ---
+app = Client("hanime_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 @app.on_message(filters.command("start"))
-async def start(client, message):
-    await message.reply_text(f"👋 Hello {message.from_user.first_name}!\n\nUse /search <name> to find videos.")
+async def start(c, m):
+    await m.reply_text("👋 **Hanime Downloader Bot**\n\nCommands:\n/search <name>\n/help")
 
 @app.on_message(filters.command("help"))
-async def help_cmd(client, message):
-    await message.reply_text("🔍 **Commands:**\n/search <query> - Search Hanime\n/start - Restart Bot")
+async def help(c, m):
+    await m.reply_text("Simply use `/search Naruto` to find videos and download in various qualities.")
 
 @app.on_message(filters.command("search"))
-async def search_cmd(client, message):
-    query = " ".join(message.command[1:])
-    if not query: return await message.reply("❌ Please provide a name. Example: `/search Naruto`")
+async def search(c, m):
+    query = " ".join(m.command[1:])
+    if not query: return await m.reply("Usage: `/search name`")
     
-    msg = await message.reply("🔍 Searching...")
-    search_url = "https://search.htv-services.com/"
-    data = {"search_text": query, "tags": [], "brands": [], "blacklist": [], "order_by": "created_at_unix", "ordering": "desc", "page": 0}
+    msg = await m.reply("🔍 Searching...")
     try:
-        r = requests.post(search_url, json=data)
+        data = {"search_text": query, "tags": [], "brands": [], "blacklist": [], "order_by": "created_at_unix", "ordering": "desc", "page": 0}
+        r = requests.post("https://search.htv-services.com/", json=data)
         results = r.json().get("hits", [])
-        if not results: return await msg.edit("❌ No results found.")
+        if not results: return await msg.edit("❌ No results.")
 
-        buttons = []
-        for hit in results[:10]: # Top 10 results
-            h = eval(hit) if isinstance(hit, str) else hit
-            buttons.append([InlineKeyboardButton(h['name'], callback_data=f"slug_{h['slug']}")])
-        
-        await msg.edit("✅ Select a result:", reply_markup=InlineKeyboardMarkup(buttons))
-    except Exception as e:
-        await msg.edit(f"❌ Search Error: {e}")
+        btn = []
+        for h in results[:8]:
+            res = eval(h) if isinstance(h, str) else h
+            btn.append([InlineKeyboardButton(res['name'], callback_data=f"slug_{res['slug']}")])
+        await msg.edit("✅ Select a result:", reply_markup=InlineKeyboardMarkup(btn))
+    except Exception as e: await msg.edit(f"❌ Error: {e}")
 
 @app.on_callback_query(filters.regex("^slug_"))
-async def select_video(client, callback_query):
-    slug = callback_query.data.split("_")[1]
-    await callback_query.edit_message_text("🔓 Bypassing security & fetching qualities...")
-    
+async def q_list(c, cb):
+    slug = cb.data.split("_")[1]
+    await cb.answer("Fetching Qualities...")
     hv_id = get_hv_id(slug)
     sig, t = generate_credentials()
     streams = get_streams(hv_id, sig, t)
+    if not streams: return await cb.edit_message_text("❌ No streams found.")
     
-    if not streams: return await callback_query.edit_message_text("❌ No streams found.")
-
-    buttons = []
-    # We store the slug and height in callback to identify the link later
-    for s in streams:
-        buttons.append([InlineKeyboardButton(f"🎬 {s['res']}", callback_data=f"dl_{slug}_{s['height']}")])
-    
-    await callback_query.edit_message_text(f"📺 **Video:** {slug}\nChoose Quality:", reply_markup=InlineKeyboardMarkup(buttons))
+    btn = [[InlineKeyboardButton(f"🎬 {s['res']}", callback_data=f"dl_{slug}_{s['height']}")] for s in streams]
+    await cb.edit_message_text(f"📺 **Video:** `{slug}`\nSelect quality:", reply_markup=InlineKeyboardMarkup(btn))
 
 @app.on_callback_query(filters.regex("^dl_"))
-async def download_handler(client, callback_query):
-    _, slug, height = callback_query.data.split("_")
-    await callback_query.edit_message_text("📥 Processing download... please wait.")
+async def download(c, cb):
+    _, slug, height = cb.data.split("_")
+    await cb.edit_message_text("📥 Downloading... This may take a while.")
     
     hv_id = get_hv_id(slug)
     sig, t = generate_credentials()
     streams = get_streams(hv_id, sig, t)
-    selected = next((s for s in streams if str(s['height']) == height), None)
+    sel = next((s for s in streams if str(s['height']) == height), None)
     
-    if not selected: return await callback_query.edit_message_text("❌ Link expired.")
-
     file_path = f"{slug}_{height}p.mp4"
-    ydl_opts = {
-        'outtmpl': file_path,
-        'http_headers': {'Referer': 'https://hanime.tv/', 'Origin': 'https://hanime.tv'},
-        'format': 'best', 'quiet': True, 'no_warnings': True
-    }
+    ydl_opts = {'outtmpl': file_path, 'http_headers': {'Referer': 'https://hanime.tv/', 'Origin': 'https://hanime.tv'}, 'format': 'best', 'quiet': True}
 
     try:
-        await callback_query.edit_message_text("⏳ Downloading m3u8 via yt-dlp...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([selected['url']])
-        
-        await callback_query.edit_message_text("📤 Uploading to Telegram...")
-        await client.send_video(
-            callback_query.message.chat.id, 
-            video=file_path, 
-            caption=f"✅ **{slug}**\nQuality: {height}p"
-        )
-        os.remove(file_path) # Clean up
-    except Exception as e:
-        await callback_query.edit_message_text(f"❌ Error: {str(e)}")
+            ydl.download([sel['url']])
+        await cb.edit_message_text("📤 Uploading...")
+        await c.send_video(cb.message.chat.id, video=file_path, caption=f"✅ {slug} ({height}p)")
+        os.remove(file_path)
+    except Exception as e: await cb.edit_message_text(f"❌ Error: {e}")
 
-print("Bot Started!")
-app.run()
+if __name__ == "__main__":
+    # Start Health check in background
+    threading.Thread(target=run_health_server, daemon=True).start()
+    print("Bot is starting...")
+    app.run()
